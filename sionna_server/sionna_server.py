@@ -14,7 +14,6 @@ gpu_num = 0 # Use "" to use the CPU
 os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_num}"
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-import sionna
 import tensorflow as tf
 from tensorflow.python.tools.optimize_for_inference_lib import node_from_map, node_name_from_input
 import mitsuba as mi
@@ -30,9 +29,8 @@ if gpus:
         print(e)
 tf.get_logger().setLevel('ERROR')
 
-from sionna.rt import load_scene, Transmitter, Receiver, PlanarArray, Camera
-from sionna.channel import cir_to_ofdm_channel, subcarrier_frequencies
-from sionna.rt.antenna import iso_pattern
+from sionna.rt import load_scene, Transmitter, Receiver, PlanarArray, Camera, PathSolver
+from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
 
 class CacheEntry:
     def __init__(self, sim_time, ttl, value):
@@ -51,8 +49,7 @@ class SionnaEnv:
     author: Pilz, Zubow
     """
 
-    def __init__(self, rt_calc_diffraction, rt_max_depth=5, rt_max_parallel_links=32, est_csi=True, VERBOSE=True):
-        self.rt_calc_diffraction = rt_calc_diffraction
+    def __init__(self, rt_max_depth=5, rt_max_parallel_links=32, est_csi=True, VERBOSE=True):
         self.rt_max_depth = rt_max_depth
         self.rt_max_parallel_links = rt_max_parallel_links
         self.est_csi = est_csi
@@ -97,22 +94,21 @@ class SionnaEnv:
                                      num_cols=1,
                                      vertical_spacing=0.5,
                                      horizontal_spacing=0.5,
-                                     pattern=iso_pattern)
+                                     pattern="iso",
+                                     polarization="V")
 
         # Configure antenna array for all receivers
         self.scene.rx_array = PlanarArray(num_rows=1,
                                      num_cols=1,
                                      vertical_spacing=0.5,
                                      horizontal_spacing=0.5,
-                                     pattern=iso_pattern)
+                                     pattern="iso",
+                                     polarization="V")
 
         # Set scene parameters
         self.scene.frequency = simulation_info.frequency
         self.scene.channel_bw = simulation_info.channel_bw
         self.scene.fft_size = simulation_info.fft_size
-
-        # If set to False, ray tracing will be done per antenna element (slower for large arrays)
-        self.scene.synthetic_array = True
 
         # Set the random seed for reproducibility
         np.random.seed(simulation_info.seed)
@@ -188,7 +184,7 @@ class SionnaEnv:
         for rx_node in list(self.node_info_dict.keys()):
             max_v = max(max_v, self.node_info_dict[rx_node]["speed"][1])
 
-        self.chan_coh_time_mode23 = int(9 * 299792458 * 1e9 / (16 * np.pi * 2 * max_v * self.scene.frequency.numpy()))
+        self.chan_coh_time_mode23 = int(9 * 299792458 * 1e9 / (16 * np.pi * 2 * max_v * self.scene.frequency.numpy()[0]))
         if self.mode == 3 or self.mode == 2:
             # worst case coherence time
             print("Running mode %d with Tc=%.2f ms" % (self.mode, self.chan_coh_time_mode23 / 1e6))
@@ -305,26 +301,31 @@ class SionnaEnv:
         a_tau_set = False
 
         # Compute propagation paths
-        paths = self.scene.compute_paths(max_depth=self.rt_max_depth,
-                                    method="fibonacci",
-                                    num_samples=1e6,
-                                    los=True,
-                                    reflection=True,
-                                    diffraction=self.rt_calc_diffraction,
-                                    scattering=False)
+        p_solver = PathSolver()
+        paths = p_solver(scene=self.scene,
+                            max_depth=self.rt_max_depth,
+                            samples_per_src=int(1e6),
+                            # If set to False, ray tracing will be done per antenna element (slower for large arrays)
+                            synthetic_array = True,
+                            los=True,
+                            specular_reflection=True,
+                            diffuse_reflection=False,
+                            seed=42)
 
         has_paths = bool(paths.types.numpy().size)
         has_los_path = np.any(paths.types.numpy()[0] == 0)
 
         # If no LOS path was found, check again with different compute_paths parameters
         if not has_los_path:
-            los_path = self.scene.compute_paths(max_depth=0,
-                                           method="fibonacci",
-                                           num_samples=1e6,
-                                           los=True,
-                                           reflection=False,
-                                           diffraction=False,
-                                           scattering=False)
+            los_path = p_solver(scene=self.scene,
+                                max_depth=0,
+                                samples_per_src=int(1e6),
+                                # If set to False, ray tracing will be done per antenna element (slower for large arrays)
+                                synthetic_array = True,
+                                los=True,
+                                specular_reflection=False,
+                                diffuse_reflection=False,
+                                seed=42)
 
             has_los_path = bool(los_path.types.numpy().size)
 
@@ -665,7 +666,6 @@ class SionnaEnv:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--single_run", help="Whether not to terminate after single run", action='store_true')
-    parser.add_argument("--rt_calc_diffraction", help="Calc diffraction in raytracing", action='store_true')
     parser.add_argument("--rt_max_depth", type=int, default=6, help="Calc diffraction in raytracing")
     parser.add_argument("--rt_max_parallel_links", type=int, default=4, help="Max no. of receivers")
     parser.add_argument("--est_csi", help="Whether to estimate complex CSI per OFDM subcarrier", action='store_true')
@@ -674,9 +674,9 @@ if __name__ == '__main__':
 
     print("ns3sionna v0.2")
     while True:
-        print("Using config: rt_calc_diffraction=%s, rt_max_depth=%s, rt_max_parallel_links=%d, est_csi=%r" % (args.rt_calc_diffraction, args.rt_max_depth, args.rt_max_parallel_links, args.est_csi))
+        print("Using config: rt_max_depth=%s, rt_max_parallel_links=%d, est_csi=%r" % (args.rt_max_depth, args.rt_max_parallel_links, args.est_csi))
         print("Waiting for new job ...")
-        env = SionnaEnv(args.rt_calc_diffraction, args.rt_max_depth, args.rt_max_parallel_links, args.est_csi, VERBOSE=args.verbose)
+        env = SionnaEnv(args.rt_max_depth, args.rt_max_parallel_links, args.est_csi, VERBOSE=args.verbose)
         env.run()
 
         if args.single_run:
