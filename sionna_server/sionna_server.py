@@ -78,15 +78,7 @@ class SionnaEnv:
             self.sub_mode = self.rt_max_parallel_links
 
         # Load the mitsuba scene used by the mobility model
-        # Mobility model uses mitsuba SCALAR variant
-        mi.set_variant('scalar_rgb')
         self.mi_scene = mi.load_file(filepath, parallel=False)
-
-        # Set the mitsuba variant back to how Sionna configures it
-        if len(gpus) > 0:
-            mi.set_variant('cuda_ad_rgb')
-        else:
-            mi.set_variant('llvm_ad_rgb')
 
         # SISO mode only
         # Configure antenna array for all transmitters
@@ -312,8 +304,9 @@ class SionnaEnv:
                             diffuse_reflection=False,
                             seed=42)
 
-        has_paths = bool(paths.types.numpy().size)
-        has_los_path = np.any(paths.types.numpy()[0] == 0)
+        has_paths = bool(paths.interactions.shape[-1])
+        agregated_interactions = paths.interactions.numpy().sum(axis=0)
+        has_los_path = np.any(agregated_interactions == 0)
 
         # If no LOS path was found, check again with different compute_paths parameters
         if not has_los_path:
@@ -327,7 +320,7 @@ class SionnaEnv:
                                 diffuse_reflection=False,
                                 seed=42)
 
-            has_los_path = bool(los_path.types.numpy().size)
+            has_los_path = bool(los_path.interactions.shape[-1])
 
             if not has_paths and not has_los_path:
                 raise SystemExit(
@@ -465,9 +458,6 @@ class SionnaEnv:
         direction = velocity / speed
         distance = np.linalg.norm(velocity * delay_left / 1e9)
 
-        # Set mitsuba variant to SCALAR for mobility model
-        mi.set_variant('scalar_rgb')
-
         while True:
             # Create a ray
             ray = mi.Ray3f(mi.Point3f(position), mi.Vector3f(direction), distance, 0.0, [])
@@ -507,12 +497,6 @@ class SionnaEnv:
 
         self.node_info_dict[node_id]["velocity"] = velocity.tolist()
         self.node_info_dict[node_id]["position"] = next_position.tolist()
-
-        # Set the mitsuba variant back to how Sionna configures it
-        if len(gpus) > 0:
-            mi.set_variant('cuda_ad_rgb')
-        else:
-            mi.set_variant('llvm_ad_rgb')
 
 
     def remove_all_cached_entries(self, simulation_time):
